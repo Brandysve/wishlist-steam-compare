@@ -1,0 +1,1 @@
+# wishlist-steam-compare
