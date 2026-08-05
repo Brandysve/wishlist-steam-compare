@@ -1,16 +1,19 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
-import { SteamGameList } from "@/components/steam-game-list";
+import { ComparisonResults } from "@/components/comparison-results";
+import { buildOfferComparison, type OfferComparisonResult } from "@/lib/offers/build-offer-comparison";
+import { DemoPriceProvider } from "@/lib/providers/demo-price-provider";
 import { parseSteamWishlistInput } from "@/lib/steam/parse-wishlist-input";
-import type { SteamGame, SteamWishlistResponse } from "@/types/steam";
+import type { SteamWishlistResponse } from "@/types/steam";
 
 const STORAGE_KEY = "wishlist-steam-compare:last-wishlist";
+const demoProvider = new DemoPriceProvider();
 
 export function WishlistSearchForm() {
   const [value, setValue] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [games, setGames] = useState<SteamGame[]>([]);
+  const [results, setResults] = useState<OfferComparisonResult[]>([]);
   const [isLoading, setIsLoading] = useState(false);
 
   useEffect(() => {
@@ -30,7 +33,7 @@ export function WishlistSearchForm() {
     window.localStorage.setItem(STORAGE_KEY, wishlist.canonicalUrl);
     setValue(wishlist.canonicalUrl);
     setError(null);
-    setGames([]);
+    setResults([]);
     setIsLoading(true);
 
     try {
@@ -40,7 +43,11 @@ export function WishlistSearchForm() {
       const data = (await response.json()) as SteamWishlistResponse & { error?: string };
 
       if (!response.ok) throw new Error(data.error ?? "La wishlist n’a pas pu être chargée.");
-      setGames(data.games);
+
+      const comparisons = await Promise.all(
+        data.games.map((game) => buildOfferComparison(game, [demoProvider])),
+      );
+      setResults(comparisons);
     } catch (requestError) {
       setError(
         requestError instanceof Error
@@ -80,7 +87,7 @@ export function WishlistSearchForm() {
             disabled={isLoading}
             className="min-h-12 rounded-lg bg-sky-500 px-6 font-semibold text-slate-950 transition hover:bg-sky-400 focus:outline-none focus:ring-2 focus:ring-sky-300 focus:ring-offset-2 focus:ring-offset-slate-950 disabled:cursor-wait disabled:opacity-60"
           >
-            {isLoading ? "Chargement…" : "Comparer"}
+            {isLoading ? "Analyse…" : "Comparer"}
           </button>
         </div>
 
@@ -97,10 +104,10 @@ export function WishlistSearchForm() {
 
       {isLoading ? (
         <div className="mt-8 rounded-xl border border-white/10 bg-white/5 p-5 text-slate-300" role="status">
-          Récupération des jeux et des prix Steam…
+          Récupération des jeux et préparation de la comparaison…
         </div>
       ) : (
-        <SteamGameList games={games} />
+        <ComparisonResults results={results} isDemo />
       )}
     </>
   );
