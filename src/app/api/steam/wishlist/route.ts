@@ -9,7 +9,14 @@ export async function GET(request: NextRequest) {
 
   try {
     const games = await fetchSteamWishlist(wishlist);
-    return NextResponse.json({ games, total: games.length });
+    return NextResponse.json(
+      { games, total: games.length },
+      {
+        headers: {
+          "Cache-Control": "public, s-maxage=1800, stale-while-revalidate=86400",
+        },
+      },
+    );
   } catch (error) {
     const code = error instanceof Error ? error.message : "UNKNOWN";
 
@@ -21,6 +28,19 @@ export async function GET(request: NextRequest) {
       return NextResponse.json(
         { error: "Cette wishlist est privée, introuvable ou indisponible." },
         { status: 404 },
+      );
+    }
+
+    if (code === "STEAM_RATE_LIMITED") {
+      return NextResponse.json(
+        {
+          error:
+            "Steam limite temporairement les requêtes. Patientez quelques heures avant de réessayer.",
+        },
+        {
+          status: 429,
+          headers: { "Retry-After": "3600" },
+        },
       );
     }
 

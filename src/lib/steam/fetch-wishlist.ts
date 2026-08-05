@@ -20,8 +20,31 @@ type AppDetailsResponse = Record<
   { success?: boolean; data?: AppDetailsData }
 >;
 
-const APP_DETAILS_BATCH_SIZE = 20;
-const APP_DETAILS_CONCURRENCY = 4;
+type AppDetailsResult = {
+  game: SteamGame | null;
+  rateLimited: boolean;
+};
+
+const APP_DETAILS_CONCURRENCY = 3;
+const RATE_LIMIT_PATTERNS = [
+  "too many requests",
+  "trop de demandes",
+  "please wait and try your request again later",
+  "veuillez patienter",
+];
+
+function isRateLimitedBody(body: string): boolean {
+  const normalized = body.toLowerCase();
+  return RATE_LIMIT_PATTERNS.some((pattern) => normalized.includes(pattern));
+}
+
+async function readResponseText(response: Response): Promise<string> {
+  try {
+    return await response.text();
+  } catch {
+    return "";
+  }
+}
 
 async function resolveSteamId(
   reference: NonNullable<ReturnType<typeof parseSteamWishlistInput>>,
@@ -40,15 +63,18 @@ async function resolveSteamId(
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/127.0 Safari/537.36",
     },
-    cache: "no-store",
+    next: { revalidate: 86400 },
     redirect: "follow",
   });
 
+  const body = await readResponseText(response);
+  if (response.status === 429 || isRateLimitedBody(body)) {
+    throw new Error("STEAM_RATE_LIMITED");
+  }
   if (response.status === 404) throw new Error("WISHLIST_UNAVAILABLE");
   if (!response.ok) throw new Error(`STEAM_PROFILE_HTTP_${response.status}`);
 
-  const xml = await response.text();
-  const steamId = xml.match(/<steamID64>(\d{17})<\/steamID64>/)?.[1];
+  const steamId = body.match(/<steamID64>(\d{17})<\/steamID64>/)?.[1];
   if (!steamId) throw new Error("WISHLIST_UNAVAILABLE");
   return steamId;
 }
@@ -65,15 +91,25 @@ async function fetchWishlistAppIds(steamId: string): Promise<number[]> {
       "Accept-Language": "fr-BE,fr;q=0.9,en;q=0.8",
       "User-Agent": "WishlistSteamCompare/0.1",
     },
-    cache: "no-store",
+    next: { revalidate: 1800 },
   });
 
+  const body = await readResponseText(response);
+  if (response.status === 429 || isRateLimitedBody(body)) {
+    throw new Error("STEAM_RATE_LIMITED");
+  }
   if (response.status === 403 || response.status === 404) {
     throw new Error("WISHLIST_UNAVAILABLE");
   }
   if (!response.ok) throw new Error(`STEAM_WISHLIST_HTTP_${response.status}`);
 
-  const payload = (await response.json()) as WishlistResponse;
+  let payload: WishlistResponse;
+  try {
+    payload = JSON.parse(body) as WishlistResponse;
+  } catch {
+    throw new Error("STEAM_WISHLIST_INVALID_RESPONSE");
+  }
+
   return (payload.response?.items ?? [])
     .map((item) => item.appid)
     .filter((appid): appid is number => Number.isSafeInteger(appid));
@@ -97,31 +133,42 @@ function normalizeGame(appId: number, details: AppDetailsData): SteamGame | null
   };
 }
 
-async function fetchAppDetailsBatch(appIds: number[]): Promise<SteamGame[]> {
+async function fetchAppDetails(appId: number): Promise<AppDetailsResult> {
   const endpoint = new URL("https://store.steampowered.com/api/appdetails");
-  endpoint.searchParams.set("appids", appIds.join(","));
+  endpoint.searchParams.set("appids", String(appId));
   endpoint.searchParams.set("cc", "be");
   endpoint.searchParams.set("l", "french");
 
-  const response = await fetch(endpoint, {
-    headers: {
-      Accept: "application/json",
-      "Accept-Language": "fr-BE,fr;q=0.9,en;q=0.8",
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/127.0 Safari/537.36",
-    },
-    next: { revalidate: 900 },
-  });
+  try {
+    const response = await fetch(endpoint, {
+      headers: {
+        Accept: "application/json",
+        "Accept-Language": "fr-BE,fr;q=0.9,en;q=0.8",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/127.0 Safari/537.36",
+      },
+      next: { revalidate: 21600 },
+    });
 
-  if (!response.ok) throw new Error(`STEAM_DETAILS_HTTP_${response.status}`);
-  const payload = (await response.json()) as AppDetailsResponse;
+    const body = await readResponseText(response);
+    if (response.status === 429 || isRateLimitedBody(body)) {
+      return { game: null, rateLimited: true };
+    }
+    if (!response.ok) return { game: null, rateLimited: false };
 
-  return appIds.flatMap((appId) => {
+    const payload = JSON.parse(body) as AppDetailsResponse;
     const entry = payload[String(appId)];
-    if (!entry?.success || !entry.data) return [];
-    const game = normalizeGame(appId, entry.data);
-    return game ? [game] : [];
-  });
+    if (!entry?.success || !entry.data) {
+      return { game: null, rateLimited: false };
+    }
+
+    return {
+      game: normalizeGame(appId, entry.data),
+      rateLimited: false,
+    };
+  } catch {
+    return { game: null, rateLimited: false };
+  }
 }
 
 async function mapWithConcurrency<T, R>(
@@ -154,14 +201,16 @@ export async function fetchSteamWishlist(rawInput: string): Promise<SteamGame[]>
   const appIds = await fetchWishlistAppIds(steamId);
   if (appIds.length === 0) return [];
 
-  const batches: number[][] = [];
-  for (let index = 0; index < appIds.length; index += APP_DETAILS_BATCH_SIZE) {
-    batches.push(appIds.slice(index, index + APP_DETAILS_BATCH_SIZE));
-  }
+  const results = await mapWithConcurrency(
+    appIds,
+    APP_DETAILS_CONCURRENCY,
+    fetchAppDetails,
+  );
+  const games = results.flatMap((result) => (result.game ? [result.game] : []));
 
-  const games = (
-    await mapWithConcurrency(batches, APP_DETAILS_CONCURRENCY, fetchAppDetailsBatch)
-  ).flat();
+  if (games.length === 0 && results.some((result) => result.rateLimited)) {
+    throw new Error("STEAM_RATE_LIMITED");
+  }
 
   return games.sort((a, b) => a.name.localeCompare(b.name, "fr"));
 }
