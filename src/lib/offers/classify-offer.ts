@@ -80,8 +80,8 @@ export function classifyOffer(
     rejectionReasons.push("Le produit nécessite ou complète un jeu existant.");
   }
 
-  if (offer.platform && !/steam|pc/i.test(offer.platform)) {
-    rejectionReasons.push("La plateforme ne correspond pas à Steam sur PC.");
+  if (!offer.platform || !/steam/i.test(offer.platform)) {
+    rejectionReasons.push("Seules les offres activables sur Steam sont acceptées.");
   }
 
   if (offer.region && !/europe|eu|global/i.test(offer.region)) {
