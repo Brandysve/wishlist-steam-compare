@@ -1,103 +1,167 @@
 import { parseSteamWishlistInput } from "@/lib/steam/parse-wishlist-input";
 import type { SteamGame } from "@/types/steam";
 
-type RawSteamSub = {
-  price?: number;
-  discount_pct?: number;
-  discount_block?: string;
-};
+type WishlistItem = { appid?: number };
+type WishlistResponse = { response?: { items?: WishlistItem[] } };
 
-type RawSteamGame = {
+type AppDetailsData = {
   name?: string;
-  capsule?: string;
-  subs?: RawSteamSub[];
+  header_image?: string;
+  price_overview?: {
+    currency?: string;
+    initial?: number;
+    final?: number;
+    discount_percent?: number;
+  };
 };
 
-type RawSteamWishlistPage = Record<string, RawSteamGame>;
+type AppDetailsResponse = Record<
+  string,
+  { success?: boolean; data?: AppDetailsData }
+>;
 
-const MAX_PAGES = 20;
-const PAGE_SIZE = 50;
+const APP_DETAILS_BATCH_SIZE = 20;
+const APP_DETAILS_CONCURRENCY = 4;
 
-function parseCurrency(discountBlock?: string): string | null {
-  if (!discountBlock) return null;
-  const match = discountBlock.match(/(?:€|EUR|USD|GBP|£|\$)/i);
-  if (!match) return null;
-  if (match[0] === "€" || match[0].toUpperCase() === "EUR") return "EUR";
-  if (match[0] === "£" || match[0].toUpperCase() === "GBP") return "GBP";
-  return "USD";
+async function resolveSteamId(
+  reference: NonNullable<ReturnType<typeof parseSteamWishlistInput>>,
+): Promise<string> {
+  if (reference.kind === "profile") return reference.value;
+
+  const profileUrl = new URL(
+    `https://steamcommunity.com/id/${encodeURIComponent(reference.value)}/`,
+  );
+  profileUrl.searchParams.set("xml", "1");
+
+  const response = await fetch(profileUrl, {
+    headers: {
+      Accept: "application/xml,text/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "fr-BE,fr;q=0.9,en;q=0.8",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/127.0 Safari/537.36",
+    },
+    cache: "no-store",
+    redirect: "follow",
+  });
+
+  if (response.status === 404) throw new Error("WISHLIST_UNAVAILABLE");
+  if (!response.ok) throw new Error(`STEAM_PROFILE_HTTP_${response.status}`);
+
+  const xml = await response.text();
+  const steamId = xml.match(/<steamID64>(\d{17})<\/steamID64>/)?.[1];
+  if (!steamId) throw new Error("WISHLIST_UNAVAILABLE");
+  return steamId;
 }
 
-function normalizeGame(appId: string, raw: RawSteamGame): SteamGame | null {
-  const numericAppId = Number(appId);
-  if (!Number.isSafeInteger(numericAppId) || !raw.name) return null;
+async function fetchWishlistAppIds(steamId: string): Promise<number[]> {
+  const endpoint = new URL(
+    "https://api.steampowered.com/IWishlistService/GetWishlist/v1/",
+  );
+  endpoint.searchParams.set("steamid", steamId);
 
-  const pricedSub = raw.subs?.find((sub) => typeof sub.price === "number");
-  const currentPrice = pricedSub?.price != null ? pricedSub.price / 100 : null;
-  const discountPercent = pricedSub?.discount_pct ?? 0;
-  const normalPrice =
-    currentPrice != null && discountPercent > 0
-      ? Number((currentPrice / (1 - discountPercent / 100)).toFixed(2))
-      : currentPrice;
+  const response = await fetch(endpoint, {
+    headers: {
+      Accept: "application/json",
+      "Accept-Language": "fr-BE,fr;q=0.9,en;q=0.8",
+      "User-Agent": "WishlistSteamCompare/0.1",
+    },
+    cache: "no-store",
+  });
 
+  if (response.status === 403 || response.status === 404) {
+    throw new Error("WISHLIST_UNAVAILABLE");
+  }
+  if (!response.ok) throw new Error(`STEAM_WISHLIST_HTTP_${response.status}`);
+
+  const payload = (await response.json()) as WishlistResponse;
+  return (payload.response?.items ?? [])
+    .map((item) => item.appid)
+    .filter((appid): appid is number => Number.isSafeInteger(appid));
+}
+
+function normalizeGame(appId: number, details: AppDetailsData): SteamGame | null {
+  if (!details.name) return null;
+
+  const price = details.price_overview;
   return {
-    appId: numericAppId,
-    name: raw.name,
+    appId,
+    name: details.name,
     capsuleUrl:
-      raw.capsule ??
-      `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${numericAppId}/header.jpg`,
-    steamUrl: `https://store.steampowered.com/app/${numericAppId}/`,
-    normalPrice,
-    currentPrice,
-    discountPercent,
-    currency: parseCurrency(pricedSub?.discount_block),
+      details.header_image ??
+      `https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/${appId}/header.jpg`,
+    steamUrl: `https://store.steampowered.com/app/${appId}/`,
+    normalPrice: price?.initial != null ? price.initial / 100 : null,
+    currentPrice: price?.final != null ? price.final / 100 : null,
+    discountPercent: price?.discount_percent ?? 0,
+    currency: price?.currency ?? null,
   };
+}
+
+async function fetchAppDetailsBatch(appIds: number[]): Promise<SteamGame[]> {
+  const endpoint = new URL("https://store.steampowered.com/api/appdetails");
+  endpoint.searchParams.set("appids", appIds.join(","));
+  endpoint.searchParams.set("cc", "be");
+  endpoint.searchParams.set("l", "french");
+
+  const response = await fetch(endpoint, {
+    headers: {
+      Accept: "application/json",
+      "Accept-Language": "fr-BE,fr;q=0.9,en;q=0.8",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/127.0 Safari/537.36",
+    },
+    next: { revalidate: 900 },
+  });
+
+  if (!response.ok) throw new Error(`STEAM_DETAILS_HTTP_${response.status}`);
+  const payload = (await response.json()) as AppDetailsResponse;
+
+  return appIds.flatMap((appId) => {
+    const entry = payload[String(appId)];
+    if (!entry?.success || !entry.data) return [];
+    const game = normalizeGame(appId, entry.data);
+    return game ? [game] : [];
+  });
+}
+
+async function mapWithConcurrency<T, R>(
+  values: T[],
+  concurrency: number,
+  mapper: (value: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < values.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(values[index]);
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, values.length) }, () => worker()),
+  );
+  return results;
 }
 
 export async function fetchSteamWishlist(rawInput: string): Promise<SteamGame[]> {
   const reference = parseSteamWishlistInput(rawInput);
   if (!reference) throw new Error("INVALID_WISHLIST");
 
-  const games = new Map<number, SteamGame>();
+  const steamId = await resolveSteamId(reference);
+  const appIds = await fetchWishlistAppIds(steamId);
+  if (appIds.length === 0) return [];
 
-  for (let page = 0; page < MAX_PAGES; page += 1) {
-    const endpoint = new URL("wishlistdata/", reference.canonicalUrl);
-    endpoint.searchParams.set("p", String(page));
-    endpoint.searchParams.set("cc", "be");
-    endpoint.searchParams.set("l", "french");
-
-    const response = await fetch(endpoint, {
-      headers: {
-        Accept: "application/json,text/plain,*/*",
-        "Accept-Language": "fr-BE,fr;q=0.9,en;q=0.8",
-        Referer: reference.canonicalUrl,
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/127.0 Safari/537.36",
-      },
-      cache: "no-store",
-      redirect: "follow",
-    });
-
-    if (response.status === 403 || response.status === 404) {
-      throw new Error("WISHLIST_UNAVAILABLE");
-    }
-    if (!response.ok) throw new Error(`STEAM_HTTP_${response.status}`);
-
-    const contentType = response.headers.get("content-type") ?? "";
-    if (!contentType.toLowerCase().includes("application/json")) {
-      throw new Error(`STEAM_INVALID_CONTENT_${response.status}`);
-    }
-
-    const data = (await response.json()) as RawSteamWishlistPage;
-    const entries = Object.entries(data);
-    if (entries.length === 0) break;
-
-    for (const [appId, rawGame] of entries) {
-      const game = normalizeGame(appId, rawGame);
-      if (game) games.set(game.appId, game);
-    }
-
-    if (entries.length < PAGE_SIZE) break;
+  const batches: number[][] = [];
+  for (let index = 0; index < appIds.length; index += APP_DETAILS_BATCH_SIZE) {
+    batches.push(appIds.slice(index, index + APP_DETAILS_BATCH_SIZE));
   }
 
-  return [...games.values()].sort((a, b) => a.name.localeCompare(b.name, "fr"));
+  const games = (
+    await mapWithConcurrency(batches, APP_DETAILS_CONCURRENCY, fetchAppDetailsBatch)
+  ).flat();
+
+  return games.sort((a, b) => a.name.localeCompare(b.name, "fr"));
 }
