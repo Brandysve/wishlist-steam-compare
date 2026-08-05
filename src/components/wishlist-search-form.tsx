@@ -8,6 +8,28 @@ import { parseSteamWishlistInput } from "@/lib/steam/parse-wishlist-input";
 import type { SteamWishlistResponse } from "@/types/steam";
 
 const STORAGE_KEY = "wishlist-steam-compare:last-wishlist";
+const MAX_CONCURRENT_SEARCHES = 4;
+
+async function mapWithConcurrency<T, R>(
+  values: T[],
+  concurrency: number,
+  mapper: (value: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < values.length) {
+      const index = cursor++;
+      results[index] = await mapper(values[index]);
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, values.length) }, () => worker()),
+  );
+  return results;
+}
 
 export function WishlistSearchForm() {
   const [value, setValue] = useState("");
@@ -44,8 +66,10 @@ export function WishlistSearchForm() {
 
       if (!response.ok) throw new Error(data.error ?? "La wishlist n’a pas pu être chargée.");
 
-      const comparisons = await Promise.all(
-        data.games.map((game) => buildOfferComparison(game, activeProviders.providers)),
+      const comparisons = await mapWithConcurrency(
+        data.games,
+        MAX_CONCURRENT_SEARCHES,
+        (game) => buildOfferComparison(game, activeProviders.providers),
       );
       setResults(comparisons);
     } catch (requestError) {
@@ -97,20 +121,20 @@ export function WishlistSearchForm() {
           </p>
         ) : (
           <p id="wishlist-help" className="text-sm text-slate-400">
-            La wishlist doit être publique. La dernière adresse valide reste mémorisée uniquement dans ce navigateur.
+            La wishlist doit être publique. Les prix Instant Gaming sont récupérés au moment de la comparaison.
           </p>
         )}
       </form>
 
-      {!activeProviders.isDemo && results.length > 0 ? (
+      {!activeProviders.hasRealProvider && results.length > 0 ? (
         <p className="mt-6 rounded-xl border border-sky-300/20 bg-sky-300/10 p-4 text-sm text-sky-100">
-          Les jeux Steam sont chargés, mais aucun fournisseur de prix réel n’est encore connecté.
+          Les jeux Steam sont chargés, mais aucun fournisseur de prix réel n’est connecté.
         </p>
       ) : null}
 
       {isLoading ? (
         <div className="mt-8 rounded-xl border border-white/10 bg-white/5 p-5 text-slate-300" role="status">
-          Récupération des jeux et préparation de la comparaison…
+          Récupération de la wishlist et recherche des prix Instant Gaming…
         </div>
       ) : (
         <ComparisonResults results={results} isDemo={activeProviders.isDemo} />
