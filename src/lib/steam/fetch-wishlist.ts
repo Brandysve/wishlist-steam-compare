@@ -16,7 +16,7 @@ type RawSteamGame = {
 type RawSteamWishlistPage = Record<string, RawSteamGame>;
 
 const MAX_PAGES = 20;
-const PAGE_SIZE = 100;
+const PAGE_SIZE = 50;
 
 function parseCurrency(discountBlock?: string): string | null {
   if (!discountBlock) return null;
@@ -60,19 +60,32 @@ export async function fetchSteamWishlist(rawInput: string): Promise<SteamGame[]>
   const games = new Map<number, SteamGame>();
 
   for (let page = 0; page < MAX_PAGES; page += 1) {
-    const endpoint = `${reference.canonicalUrl}wishlistdata/?p=${page}&cc=be&l=french`;
+    const endpoint = new URL("wishlistdata/", reference.canonicalUrl);
+    endpoint.searchParams.set("p", String(page));
+    endpoint.searchParams.set("cc", "be");
+    endpoint.searchParams.set("l", "french");
+
     const response = await fetch(endpoint, {
       headers: {
-        Accept: "application/json",
-        "User-Agent": "WishlistSteamCompare/0.1 (+https://github.com/Brandysve/wishlist-steam-compare)",
+        Accept: "application/json,text/plain,*/*",
+        "Accept-Language": "fr-BE,fr;q=0.9,en;q=0.8",
+        Referer: reference.canonicalUrl,
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/127.0 Safari/537.36",
       },
-      next: { revalidate: 900 },
+      cache: "no-store",
+      redirect: "follow",
     });
 
     if (response.status === 403 || response.status === 404) {
       throw new Error("WISHLIST_UNAVAILABLE");
     }
-    if (!response.ok) throw new Error("STEAM_UNAVAILABLE");
+    if (!response.ok) throw new Error(`STEAM_HTTP_${response.status}`);
+
+    const contentType = response.headers.get("content-type") ?? "";
+    if (!contentType.toLowerCase().includes("application/json")) {
+      throw new Error(`STEAM_INVALID_CONTENT_${response.status}`);
+    }
 
     const data = (await response.json()) as RawSteamWishlistPage;
     const entries = Object.entries(data);
