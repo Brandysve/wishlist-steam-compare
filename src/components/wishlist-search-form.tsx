@@ -1,20 +1,20 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { ComparisonResults } from "@/components/comparison-results";
 import { buildOfferComparison, type OfferComparisonResult } from "@/lib/offers/build-offer-comparison";
-import { DemoPriceProvider } from "@/lib/providers/demo-price-provider";
+import { getActiveProviders } from "@/lib/providers/get-active-providers";
 import { parseSteamWishlistInput } from "@/lib/steam/parse-wishlist-input";
 import type { SteamWishlistResponse } from "@/types/steam";
 
 const STORAGE_KEY = "wishlist-steam-compare:last-wishlist";
-const demoProvider = new DemoPriceProvider();
 
 export function WishlistSearchForm() {
   const [value, setValue] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [results, setResults] = useState<OfferComparisonResult[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const activeProviders = useMemo(() => getActiveProviders(), []);
 
   useEffect(() => {
     const savedValue = window.localStorage.getItem(STORAGE_KEY);
@@ -45,7 +45,7 @@ export function WishlistSearchForm() {
       if (!response.ok) throw new Error(data.error ?? "La wishlist n’a pas pu être chargée.");
 
       const comparisons = await Promise.all(
-        data.games.map((game) => buildOfferComparison(game, [demoProvider])),
+        data.games.map((game) => buildOfferComparison(game, activeProviders.providers)),
       );
       setResults(comparisons);
     } catch (requestError) {
@@ -102,12 +102,18 @@ export function WishlistSearchForm() {
         )}
       </form>
 
+      {!activeProviders.isDemo && results.length > 0 ? (
+        <p className="mt-6 rounded-xl border border-sky-300/20 bg-sky-300/10 p-4 text-sm text-sky-100">
+          Les jeux Steam sont chargés, mais aucun fournisseur de prix réel n’est encore connecté.
+        </p>
+      ) : null}
+
       {isLoading ? (
         <div className="mt-8 rounded-xl border border-white/10 bg-white/5 p-5 text-slate-300" role="status">
           Récupération des jeux et préparation de la comparaison…
         </div>
       ) : (
-        <ComparisonResults results={results} isDemo />
+        <ComparisonResults results={results} isDemo={activeProviders.isDemo} />
       )}
     </>
   );
