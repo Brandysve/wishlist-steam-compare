@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { fetchSteamWishlist } from "@/lib/steam/fetch-wishlist";
 
-export const runtime = "edge";
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 export async function GET(request: NextRequest) {
   const wishlist = request.nextUrl.searchParams.get("wishlist") ?? "";
@@ -22,6 +23,8 @@ export async function GET(request: NextRequest) {
         { status: 404 },
       );
     }
+
+    console.error("Steam wishlist request failed", { code });
 
     return NextResponse.json(
       { error: "Steam ne répond pas pour le moment. Réessayez plus tard." },
